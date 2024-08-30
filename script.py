@@ -9,7 +9,7 @@ import time
 import torch
 
 model = torch.hub.load('ultralytics/yolov5', 'custom', path='last.pt', force_reload=True)
-model.conf = 0.005
+model.conf = 0.02
 
 w, h = pyautogui.size()
 print("PIL Screen Capture Speed Test")

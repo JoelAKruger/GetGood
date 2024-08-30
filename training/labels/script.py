@@ -17,7 +17,7 @@ lines = file.readlines()
 modified_lines = []
 for line in lines:
 parts = line.split()
-if len(parts) == 5 and parts[0] == '15':
+if len(parts) == 5 and parts[0] == '1':
 parts[0] = '0'
 modified_lines.append(' '.join(parts) + '\n')
 
