@@ -1,11 +1,18 @@
-#include <opencv2/opencv.hpp>
 #include <Windows.h>
+
+#include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
+
+#include <assert.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "onnxruntime.lib")
-#pragma comment(lib, "../../opencv/build/x64/vc16/lib/opencv_world4100.lib")
+#pragma comment(lib, "opencv_world4100.lib")
+
+#include "Types.h"
+#include "Timer.cpp"
+#include "Profiler.cpp"
 
 struct game_context
 {
@@ -19,80 +26,221 @@ struct game_context
     void* Pixels;
 };
 
-#define INPUT_DIMENSION 640
+struct inference_detection
+{
+    float Confidence;
+    float X, Y, W, H; //X and Y are the middle of the rectangle
+};
 
-game_context CreateGameContext()
+struct PCMouseUpdate
+{
+    int32_t dX;
+    int32_t dY;
+    uint32_t Click;
+};
+
+static game_context
+CreateGameContext()
 {
     game_context Context = {};
     
     Context.Window = GetForegroundWindow();
-    /*
-    if (!ValWindow)
-    {
-        MessageBoxA(0, "Could not find Valorant window", "Error", MB_OK|MB_ICONWARNING);
-        return 0;
-    }
-*/
     
-    Context.DC = GetDC(Context.Window);
+    if (!Context.Window)
+    {
+        MessageBoxA(0, "Failed to get the window", "Error", MB_OK|MB_ICONWARNING);
+        return {};
+    }
+    
+    
+    Context.DC = GetDC(0);
     
     RECT WindowRect = {};
-    GetClientRect(Context.Window, &WindowRect);
+    GetWindowRect(Context.Window, &WindowRect);
     
-    Context.Width = WindowRect.right;
-    Context.Height = WindowRect.bottom;
+    Context.Width = (WindowRect.right - WindowRect.left) / 4 * 4;
+    Context.Height = (WindowRect.bottom - WindowRect.top) / 4 * 4;
     
     Context.CompatibleDC = CreateCompatibleDC(Context.DC);
-    Context.Bitmap = CreateCompatibleBitmap(Context.DC, INPUT_DIMENSION, INPUT_DIMENSION);
+    Context.Bitmap = CreateCompatibleBitmap(Context.DC, Context.Width, Context.Height);
     
     SelectObject(Context.CompatibleDC, Context.Bitmap);
-    StretchBlt(Context.CompatibleDC, 0, 0, INPUT_DIMENSION, INPUT_DIMENSION, Context.DC, 0, 0, Context.Width, Context.Height, SRCCOPY);
     
     Context.BitmapHeader.biSize = sizeof(BITMAPINFOHEADER);
-    Context.BitmapHeader.biWidth = INPUT_DIMENSION;
-    Context.BitmapHeader.biHeight = -INPUT_DIMENSION;
+    Context.BitmapHeader.biWidth = Context.Width;
+    Context.BitmapHeader.biHeight = -Context.Height;
     Context.BitmapHeader.biPlanes = 1;
-    Context.BitmapHeader.biBitCount = 32;
+    Context.BitmapHeader.biBitCount = 24;
     Context.BitmapHeader.biCompression = BI_RGB;
     
-    Context.Pixels = VirtualAlloc(0, INPUT_DIMENSION * INPUT_DIMENSION * 4, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-    
-    GetDIBits(Context.CompatibleDC, Context.Bitmap, 0, INPUT_DIMENSION, Context.Pixels,  (BITMAPINFO*)&Context.BitmapHeader, DIB_RGB_COLORS);
+    Context.Pixels = VirtualAlloc(0, Context.Width * Context.Height * 3, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     
     return Context;
 }
 
-int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, LPWSTR CommandLine, int ShowCode)
+static void
+GetFrame(game_context* Context)
 {
-    wchar_t* ModelPath = L"../volov8s_32batch_300epoch.onnx";
+    TimeFunction;
     
-    auto providers = Ort::GetAvailableProviders();
-    for (auto provider : providers) {
-        OutputDebugStringA(provider.c_str());
-        OutputDebugStringA("\n");
+    RECT WindowRect = {};
+    GetWindowRect(Context->Window, &WindowRect);
+    BitBlt(Context->CompatibleDC, 0, 0, Context->Width, Context->Height, Context->DC, WindowRect.left, WindowRect.top, SRCCOPY);
+    GetDIBits(Context->CompatibleDC, Context->Bitmap, 0, Context->Height, Context->Pixels,  (BITMAPINFO*)&Context->BitmapHeader, DIB_RGB_COLORS);
+}
+
+static std::vector<inference_detection>
+RunInference(cv::dnn::Net& Network, cv::Size ModelShape, const cv::Mat& Frame)
+{
+    TimeFunction;
+    
+    cv::Mat Blob;
+    cv::dnn::blobFromImage(Frame, Blob, 1.0f / 255.0f, ModelShape, cv::Scalar(), true, false);
+    
+    Network.setInput(Blob);
+    
+    std::vector<cv::Mat> Outputs;
+    Network.forward(Outputs, Network.getUnconnectedOutLayersNames());
+    
+    int BatchSize = Outputs[0].size[0];
+    int Rows = Outputs[0].size[2];
+    int Dimensions = Outputs[0].size[1];
+    
+    float XScale = (float)Frame.cols / ModelShape.width;
+    float YScale = (float)Frame.rows / ModelShape.height;
+    
+    Outputs[0] = Outputs[0].reshape(1, Dimensions);
+    cv::transpose(Outputs[0], Outputs[0]);
+    float* Data = (float*)Outputs[0].data;
+    
+    std::vector<inference_detection> Detections;
+    
+    std::vector<f32> Confidences;
+    std::vector<cv::Rect> Boxes;
+    
+    float Threshold = 0.3f;
+    for (int Row = 0; Row < Rows; Row++)
+    {
+        float Score = Data[4];
+        
+        if (Score > Threshold)
+        {
+            float X = Data[0] * XScale;
+            float Y = Data[1] * YScale;
+            float W = Data[2] * XScale;
+            float H = Data[3] * YScale;
+            
+            inference_detection Inference = {Score, X, Y, W, H};
+            Detections.push_back(Inference);
+            
+            Boxes.emplace_back((int)(X - 0.5f * W), (int)(Y - 0.5f * H), (int)W, (int)H);
+            Confidences.push_back(Score);
+        }
+        
+        Data += Dimensions;
     }
     
+    f32 NMSThreshold = 0.4f;
+    
+    //Run non-maximum suppression to eliminate duplicate detections
+    std::vector<int> NMSResult;
+    cv::dnn::NMSBoxes(Boxes, Confidences, Threshold, NMSThreshold, NMSResult);
+    
+    std::vector<inference_detection> Result;
+    
+    for (int Index : NMSResult)
+    {
+        Result.push_back(Detections[Index]);
+    }
+    
+    return Result;
+}
+
+int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, LPWSTR CommandLine, int ShowCode)
+{
+    GetCPUFrequency(100);
+    
+    char* ModelPath = "../volov8s_10batch_1280size.onnx";
+    
+    //Wait for user to switch to the game window
     Sleep(3000);
+    
     game_context Game = CreateGameContext();
     
-    cv::Mat Image(INPUT_DIMENSION, INPUT_DIMENSION, CV_8UC4, Game.Pixels);
     
-    Ort::Env env = Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "Default");
-    Ort::SessionOptions sessionOptions;
-    sessionOptions.SetInterOpNumThreads(1);
-    sessionOptions.SetIntraOpNumThreads(1);
-    sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+    HANDLE ArduinoCOM = CreateFileA("\\\\.\\COM3", GENERIC_WRITE, 0, 0, OPEN_EXISTING, 0, 0);
+    if (ArduinoCOM == INVALID_HANDLE_VALUE)
+    {
+        MessageBoxA(0, "Failed to get connect to the arduino", "Error", MB_OK|MB_ICONWARNING);
+    }
     
-    Ort::Session session = Ort::Session(env, ModelPath, sessionOptions);
     
-    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    bool UseCUDA = true;
     
-    //std::vector<Ort::Value> inputTensor;        // Onnxruntime allowed input
+    cv::dnn::Net ONNXNetwork = cv::dnn::readNetFromONNX(ModelPath);
+    cv::Size ModelShape = {1280, 1280};
     
-    ///Ort::Value::CreateTensor<float>(memory_info, (float*)Image.data, input_tensor_size, input_node_dims[0].data(), input_node_dims[0].size());
+    if (UseCUDA)
+    {
+        ONNXNetwork.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+        ONNXNetwork.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+    }
     
-    cv::imshow("Valorant Window", Image);
-    cv::waitKey(0);
+    char* ClassName = "enemy";
+    
+    while (true)
+    {
+        BeginProfile();
+        
+        GetFrame(&Game);
+        
+        {
+            cv::Mat Image(Game.Height, Game.Width, CV_8UC3, Game.Pixels);
+            
+            std::vector<inference_detection> Inferences = RunInference(ONNXNetwork, ModelShape, Image);
+            
+            {
+                TimeBlock("Render");
+                for (inference_detection Inference : Inferences)
+                {
+                    cv::Rect Rect = cv::Rect((int)(Inference.X - 0.5f * Inference.W), (int)(Inference.Y - 0.5f * Inference.H), (int)Inference.W, (int)Inference.H);
+                    cv::rectangle(Image, Rect, cv::Scalar(1.0f), 2);
+                }
+                
+                cv::imshow("Valorant Window", Image);
+                
+                
+                if (Inferences.size() > 0)
+                {
+                    inference_detection Inference = Inferences[0];
+                    
+                    //Get normalised coordinates
+                    float X = Inference.X / Game.Width;
+                    float Y = Inference.Y / Game.Height;
+                    
+                    float dX = X - 0.5f;
+                    float dY = Y - 0.5f;
+                    
+                    float Speed = 100.0f;
+                    
+                    PCMouseUpdate Update = {};
+                    Update.dX = Speed * dX;
+                    Update.dY = Speed * dY;
+                    
+                    char MessageBuffer[256];
+                    sprintf_s(MessageBuffer, "dX: %d, dY: %d", Update.dX, Update.dY);
+                    OutputDebugStringA(MessageBuffer);
+                    
+                    WriteFile(ArduinoCOM, &Update, sizeof(Update), 0, 0);
+                }
+                
+                
+                cv::waitKey(1);
+            }
+        }
+        
+        OutputProfileReadout();
+    }
     
     return 0;
 }
