@@ -22,7 +22,6 @@ struct game_context
     HDC CompatibleDC;
     HBITMAP Bitmap;
     BITMAPINFOHEADER BitmapHeader;
-    
     void* Pixels;
 };
 
@@ -156,6 +155,16 @@ RunInference(cv::dnn::Net& Network, cv::Size ModelShape, const cv::Mat& Frame)
     return Result;
 }
 
+static void
+SendUpdate(HANDLE Arduino, int8_t dX, int8_t dY)
+{
+    PCMouseUpdate Update = {};
+    Update.dX = dX;
+    Update.dY = dY;
+    
+    WriteFile(Arduino, &Update, sizeof(Update), 0, 0);
+}
+
 int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, LPWSTR CommandLine, int ShowCode)
 {
     GetCPUFrequency(100);
@@ -218,20 +227,50 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, LPWSTR CommandLine, int ShowC
                     float X = Inference.X / Game.Width;
                     float Y = Inference.Y / Game.Height;
                     
-                    float dX = X - 0.5f;
-                    float dY = Y - 0.5f;
+                    float CenterX = 0.5f;
+                    float CenterY = 0.52f;
                     
-                    float Speed = 100.0f;
+                    float dX = X - CenterX;
+                    float dY = Y - CenterY;
                     
-                    PCMouseUpdate Update = {};
-                    Update.dX = Speed * dX;
-                    Update.dY = Speed * dY;
+                    float Speed = 10000.0f;
+                    
+                    int MoveX = Speed * dX;
+                    int MoveY = Speed * dY;
                     
                     char MessageBuffer[256];
-                    sprintf_s(MessageBuffer, "dX: %d, dY: %d", Update.dX, Update.dY);
+                    sprintf_s(MessageBuffer, "dX: %d, dY: %d\n", MoveX, MoveY);
                     OutputDebugStringA(MessageBuffer);
                     
-                    WriteFile(ArduinoCOM, &Update, sizeof(Update), 0, 0);
+                    int MaxMove = 50;
+                    
+                    while (MoveX != 0 || MoveY != 0)
+                    {
+                        int SendX = 0;
+                        int SendY = 0;
+                        
+                        if (MoveX > 0)
+                        {
+                            SendX = MIN(MoveX, MaxMove);
+                        }
+                        if (MoveX < 0)
+                        {
+                            SendX = MAX(MoveX, -MaxMove);
+                        }
+                        if (MoveY > 0)
+                        {
+                            SendY = MIN(MoveY, MaxMove);
+                        }
+                        if (MoveY < 0)
+                        {
+                            SendY = MAX(MoveY, -MaxMove);
+                        }
+                        
+                        MoveX -= SendX;
+                        MoveY -= SendY;
+                        
+                        SendUpdate(ArduinoCOM, (int8_t)SendX, (int8_t)SendY);
+                    }
                 }
                 
                 
@@ -239,7 +278,7 @@ int WINAPI wWinMain(HINSTANCE Instance, HINSTANCE, LPWSTR CommandLine, int ShowC
             }
         }
         
-        OutputProfileReadout();
+        //OutputProfileReadout();
     }
     
     return 0;
